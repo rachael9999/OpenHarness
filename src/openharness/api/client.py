@@ -22,6 +22,7 @@ from openharness.auth.external import (
     claude_oauth_betas,
     claude_oauth_headers,
     get_claude_code_session_id,
+    is_third_party_anthropic_endpoint,
 )
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import ConversationMessage, assistant_message_from_api
@@ -137,7 +138,12 @@ class AnthropicApiClient:
     def _create_client(self) -> AsyncAnthropic:
         kwargs: dict[str, Any] = {}
         if self._api_key:
-            kwargs["api_key"] = self._api_key
+            # Third-party endpoints (e.g. MiniMax) expect Bearer auth, not X-Api-Key
+            if self._base_url and is_third_party_anthropic_endpoint(self._base_url):
+                kwargs["auth_token"] = self._api_key
+                kwargs["default_headers"] = {"anthropic-beta": OAUTH_BETA_HEADER}
+            else:
+                kwargs["api_key"] = self._api_key
         if self._auth_token:
             kwargs["auth_token"] = self._auth_token
             kwargs["default_headers"] = (

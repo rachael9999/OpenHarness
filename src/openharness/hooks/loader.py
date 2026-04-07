@@ -57,4 +57,40 @@ def load_hook_registry(settings, plugins=None) -> HookRegistry:
                 continue
             for hook in hooks:
                 registry.register(event, hook)
+    _add_graphify_hook(registry)
     return registry
+
+
+def _add_graphify_hook(registry: HookRegistry) -> None:
+    """Add built-in PreToolUse hook for Glob/Grep if graphify graph exists."""
+    from pathlib import Path
+    import os
+
+    # Check if graphify graph exists in cwd
+    cwd = os.getcwd()
+    graph_path = Path(cwd) / "graphify-out" / "graph.json"
+    if not graph_path.exists():
+        return
+
+    # Check if a graphify hook is already registered
+    existing = registry.get(HookEvent.PRE_TOOL_USE)
+    for hook in existing:
+        matcher = getattr(hook, "matcher", None)
+        if matcher and "graphify" in str(matcher).lower():
+            return  # already registered
+
+    # Add the graphify PreToolUse hook
+    from openharness.hooks.schemas import CommandHookDefinition
+
+    registry.register(
+        HookEvent.PRE_TOOL_USE,
+        CommandHookDefinition(
+            command=(
+                "[ -f graphify-out/graph.json ] && "
+                "echo '[graphify] Knowledge graph found. Consider querying it with /graphify for architecture context before searching raw files.' || true"
+            ),
+            timeout_seconds=5,
+            matcher="Glob|Grep",
+            block_on_failure=False,
+        ),
+    )

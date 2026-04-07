@@ -29,6 +29,8 @@ dependencies = [
     "questionary>=2.0.1",
     "watchfiles>=0.20.0",
     "croniter>=2.0.0",
+    "graphifyy>=0.3.0",
+    "pypdf>=5.0.0",
 ]
 
 [project.optional-dependencies]

@@ -7,28 +7,17 @@ from pathlib import Path
 
 import pytest
 
-from openharness.auth.storage import store_credential
-from openharness.config.settings import (
-    ProviderProfile,
-    Settings,
-    display_model_setting,
-    load_settings,
-    normalize_anthropic_model_name,
-    save_settings,
-)
+from openharness.config.settings import Settings, load_settings, save_settings
 
 
 class TestSettings:
     def test_defaults(self):
         s = Settings()
         assert s.api_key == ""
-        assert s.model == "claude-sonnet-4-6"
+        assert s.model == "claude-sonnet-4-20250514"
         assert s.max_tokens == 16384
-        assert s.max_turns == 200
         assert s.fast_mode is False
         assert s.permission.mode == "default"
-        assert s.sandbox.enabled is False
-        assert s.sandbox.filesystem.allow_write == ["."]
 
     def test_resolve_api_key_from_instance(self):
         s = Settings(api_key="sk-test-123")
@@ -38,6 +27,15 @@ class TestSettings:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-env-456")
         s = Settings()
         assert s.resolve_api_key() == "sk-env-456"
+
+    def test_resolve_api_key_from_dotenv(self, tmp_path: Path, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-dotenv-123\n", encoding="utf-8")
+
+        s = Settings()
+
+        assert s.resolve_api_key() == "sk-dotenv-123"
 
     def test_resolve_api_key_instance_takes_precedence(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-env-456")
@@ -69,7 +67,7 @@ class TestLoadSaveSettings:
     def test_load_missing_file_returns_defaults(self, tmp_path: Path):
         path = tmp_path / "nonexistent.json"
         s = load_settings(path)
-        assert s == Settings().materialize_active_profile()
+        assert s == Settings()
 
     def test_load_existing_file(self, tmp_path: Path):
         path = tmp_path / "settings.json"
@@ -88,168 +86,6 @@ class TestLoadSaveSettings:
         assert loaded.api_key == original.api_key
         assert loaded.model == original.model
         assert loaded.verbose == original.verbose
-
-    def test_load_migrates_flat_provider_settings_to_profile(self, tmp_path: Path):
-        path = tmp_path / "settings.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "api_format": "anthropic",
-                    "provider": "anthropic",
-                    "model": "kimi-k2.5",
-                    "base_url": "https://api.moonshot.cn/anthropic",
-                }
-            ),
-            encoding="utf-8",
-        )
-
-        loaded = load_settings(path)
-        profile_name, profile = loaded.resolve_profile()
-
-        assert profile_name == "anthropic"
-        assert profile.base_url == "https://api.moonshot.cn/anthropic"
-        assert profile.resolved_model == "kimi-k2.5"
-        assert loaded.base_url == "https://api.moonshot.cn/anthropic"
-        assert loaded.model == "kimi-k2.5"
-
-    def test_materialize_active_profile_uses_profile_model(self):
-        settings = Settings(
-            active_profile="codex",
-            profiles={
-                "codex": ProviderProfile(
-                    label="Codex Subscription",
-                    provider="openai_codex",
-                    api_format="openai",
-                    auth_source="codex_subscription",
-                    default_model="gpt-5.4",
-                    last_model="gpt-5",
-                )
-            },
-        )
-
-        materialized = settings.materialize_active_profile()
-
-        assert materialized.provider == "openai_codex"
-        assert materialized.api_format == "openai"
-        assert materialized.model == "gpt-5"
-
-    def test_claude_profile_materializes_alias_to_concrete_model(self):
-        settings = Settings(
-            active_profile="claude-subscription",
-            profiles={
-                "claude-subscription": ProviderProfile(
-                    label="Claude Subscription",
-                    provider="anthropic_claude",
-                    api_format="anthropic",
-                    auth_source="claude_subscription",
-                    default_model="sonnet",
-                    last_model="opus",
-                )
-            },
-        )
-
-        materialized = settings.materialize_active_profile()
-
-        assert materialized.model == "claude-opus-4-6"
-
-    def test_claude_profile_normalizes_prefixed_model_name(self):
-        settings = Settings(
-            active_profile="claude-subscription",
-            profiles={
-                "claude-subscription": ProviderProfile(
-                    label="Claude Subscription",
-                    provider="anthropic_claude",
-                    api_format="anthropic",
-                    auth_source="claude_subscription",
-                    default_model="claude-sonnet-4-6",
-                    last_model="anthropic/claude-sonnet-4-20250514",
-                )
-            },
-        )
-
-        materialized = settings.materialize_active_profile()
-
-        assert materialized.model == "claude-sonnet-4-20250514"
-
-    def test_claude_profile_normalizes_dotted_model_name(self):
-        settings = Settings(
-            active_profile="claude-api",
-            profiles={
-                "claude-api": ProviderProfile(
-                    label="Claude API",
-                    provider="anthropic",
-                    api_format="anthropic",
-                    auth_source="anthropic_api_key",
-                    default_model="claude-sonnet-4-6",
-                    last_model="claude-opus-4.6",
-                )
-            },
-        )
-
-        materialized = settings.materialize_active_profile()
-
-        assert materialized.model == "claude-opus-4-6"
-
-    def test_display_model_setting_uses_default_alias(self):
-        profile = ProviderProfile(
-            label="Claude API",
-            provider="anthropic",
-            api_format="anthropic",
-            auth_source="anthropic_api_key",
-            default_model="claude-sonnet-4-6",
-            last_model=None,
-        )
-
-        assert display_model_setting(profile) == "default"
-
-    def test_opusplan_resolves_by_permission_mode(self):
-        settings = Settings(
-            permission={"mode": "plan"},
-            active_profile="claude-api",
-            profiles={
-                "claude-api": ProviderProfile(
-                    label="Claude API",
-                    provider="anthropic",
-                    api_format="anthropic",
-                    auth_source="anthropic_api_key",
-                    default_model="claude-sonnet-4-6",
-                    last_model="opusplan",
-                )
-            },
-        )
-
-        materialized = settings.materialize_active_profile()
-
-        assert materialized.model == "claude-opus-4-6"
-
-    def test_resolve_auth_prefers_profile_scoped_credential_for_custom_compatible_profile(self, tmp_path: Path, monkeypatch):
-        monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path))
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-global-env")
-        store_credential("profile:kimi-anthropic", "api_key", "sk-profile-specific", use_keyring=False)
-        settings = Settings(
-            active_profile="kimi-anthropic",
-            profiles={
-                "kimi-anthropic": ProviderProfile(
-                    label="Kimi Anthropic",
-                    provider="anthropic",
-                    api_format="anthropic",
-                    auth_source="anthropic_api_key",
-                    default_model="kimi-k2.5",
-                    base_url="https://api.moonshot.cn/anthropic",
-                    credential_slot="kimi-anthropic",
-                )
-            },
-        )
-
-        resolved = settings.resolve_auth()
-
-        assert resolved.value == "sk-profile-specific"
-        assert resolved.source == "file:profile:kimi-anthropic"
-
-
-def test_normalize_anthropic_model_name_matches_hermes_behavior():
-    assert normalize_anthropic_model_name("anthropic/claude-sonnet-4-20250514") == "claude-sonnet-4-20250514"
-    assert normalize_anthropic_model_name("claude-opus-4.6") == "claude-opus-4-6"
 
     def test_save_creates_parent_dirs(self, tmp_path: Path):
         path = tmp_path / "deep" / "nested" / "settings.json"
@@ -277,39 +113,39 @@ def test_normalize_anthropic_model_name_matches_hermes_behavior():
         path.write_text(json.dumps({"model": "from-file", "base_url": "https://file.example"}))
         monkeypatch.setenv("ANTHROPIC_MODEL", "from-env-model")
         monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://env.example/anthropic")
-        monkeypatch.setenv("OPENHARNESS_MAX_TURNS", "42")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-env-override")
-        monkeypatch.setenv("OPENHARNESS_SANDBOX_ENABLED", "true")
-        monkeypatch.setenv("OPENHARNESS_SANDBOX_FAIL_IF_UNAVAILABLE", "1")
 
         s = load_settings(path)
 
         assert s.model == "from-env-model"
         assert s.base_url == "https://env.example/anthropic"
-        assert s.max_turns == 42
         assert s.api_key == "sk-env-override"
-        assert s.sandbox.enabled is True
-        assert s.sandbox.fail_if_unavailable is True
 
-    def test_load_with_sandbox_settings(self, tmp_path: Path):
+    def test_load_applies_dotenv_overrides(self, tmp_path: Path, monkeypatch):
         path = tmp_path / "settings.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "sandbox": {
-                        "enabled": True,
-                        "enabled_platforms": ["linux", "wsl"],
-                        "network": {"allowed_domains": ["github.com"]},
-                        "filesystem": {"allow_write": [".", "/tmp"], "deny_write": [".env"]},
-                    }
-                }
-            )
+        path.write_text(json.dumps({"model": "from-file", "base_url": "https://file.example"}))
+        monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            "ANTHROPIC_MODEL=from-dotenv-model\n"
+            "ANTHROPIC_BASE_URL=https://dotenv.example/anthropic\n"
+            "ANTHROPIC_API_KEY=sk-dotenv-override\n",
+            encoding="utf-8",
         )
 
         s = load_settings(path)
 
-        assert s.sandbox.enabled is True
-        assert s.sandbox.enabled_platforms == ["linux", "wsl"]
-        assert s.sandbox.network.allowed_domains == ["github.com"]
-        assert s.sandbox.filesystem.allow_write == [".", "/tmp"]
-        assert s.sandbox.filesystem.deny_write == [".env"]
+        assert s.model == "from-dotenv-model"
+        assert s.base_url == "https://dotenv.example/anthropic"
+        assert s.api_key == "sk-dotenv-override"
+
+    def test_process_env_takes_precedence_over_dotenv(self, tmp_path: Path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-env-wins")
+        (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-dotenv-loses\n", encoding="utf-8")
+
+        s = load_settings(tmp_path / "missing.json")
+
+        assert s.api_key == "sk-env-wins"

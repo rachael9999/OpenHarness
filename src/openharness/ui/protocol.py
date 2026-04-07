@@ -25,8 +25,6 @@ class FrontendRequest(BaseModel):
         "shutdown",
     ]
     line: str | None = None
-    command: str | None = None
-    value: str | None = None
     request_id: str | None = None
     allowed: bool | None = None
     answer: str | None = None

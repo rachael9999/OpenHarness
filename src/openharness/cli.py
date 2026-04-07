@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -10,6 +11,17 @@ from typing import Optional
 import typer
 
 __version__ = "0.1.2"
+
+
+def _run_async(coro):
+    """Run a coroutine in a new thread to avoid event loop conflicts."""
+    import concurrent.futures
+
+    def run_in_thread():
+        return asyncio.run(coro)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(run_in_thread).result()
 
 
 def _version_callback(value: bool) -> None:
@@ -1318,7 +1330,7 @@ def main(
                 raise typer.Exit(1)
 
         # Pass restored session to the REPL
-        asyncio.run(
+        _run_async(
             run_repl(
                 prompt=None,
                 cwd=cwd,
@@ -1337,7 +1349,7 @@ def main(
         if not prompt:
             print("Error: -p/--print requires a prompt value, e.g. -p 'your prompt'", file=sys.stderr)
             raise typer.Exit(1)
-        asyncio.run(
+        _run_async(
             run_print_mode(
                 prompt=prompt,
                 output_format=output_format or "text",
@@ -1354,7 +1366,7 @@ def main(
         )
         return
 
-    asyncio.run(
+    _run_async(
         run_repl(
             prompt=None,
             cwd=cwd,

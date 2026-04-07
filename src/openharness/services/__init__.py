@@ -5,6 +5,7 @@ from openharness.services.compact import (
     estimate_conversation_tokens,
     summarize_messages,
 )
+from openharness.services.knowledge_base import ingest_attachments_to_knowledge_base
 from openharness.services.session_storage import (
     export_session_markdown,
     get_project_session_dir,
@@ -20,6 +21,7 @@ __all__ = [
     "estimate_tokens",
     "export_session_markdown",
     "get_project_session_dir",
+    "ingest_attachments_to_knowledge_base",
     "load_session_snapshot",
     "save_session_snapshot",
     "summarize_messages",

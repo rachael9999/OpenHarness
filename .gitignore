@@ -22,6 +22,9 @@ htmlcov/
 *.swo
 *~
 .python-version
+graphify-out/
+.claude/
+CLAUDE.md
 
 # React TUI frontend
 frontend/terminal/node_modules/
