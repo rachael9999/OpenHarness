@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import importlib.metadata
+import asyncio
 import json
 import re
 import shlex
 import shutil
 import subprocess
+import sys
 from collections import Counter, deque
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -41,6 +43,7 @@ from openharness.memory import (
 )
 from openharness.output_styles import load_output_styles
 from openharness.permissions import PermissionChecker, PermissionMode
+from openharness.platforms import get_platform
 from openharness.plugins import load_plugins
 from openharness.prompts import build_runtime_system_prompt
 from openharness.plugins.installer import install_plugin_from_path, uninstall_plugin
@@ -258,6 +261,103 @@ def _graphify_find_best_node(nodes: list[dict[str, object]], text: str) -> str |
     if best_score <= 0:
         return None
     return best_id
+
+
+def _graphify_rebuild_code_fast(base_path: Path) -> tuple[bool, str]:
+    """Rebuild graphify outputs with schema normalization and lower latency.
+
+    Returns (success, message).
+    """
+    try:
+        from graphify.analyze import god_nodes, surprising_connections
+        from graphify.build import build_from_json
+        from graphify.cluster import cluster, score_all
+        from graphify.export import to_json
+        from graphify.extract import extract
+        from graphify.report import generate
+    except Exception as exc:  # pragma: no cover
+        return False, f"Graphify import failed: {exc}"
+
+    code_exts = {
+        ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".go", ".rs", ".rb", ".php", ".c", ".h",
+        ".cpp", ".hpp", ".cc", ".cs", ".swift", ".m", ".scala", ".sh", ".bash", ".zsh", ".ps1", ".sql", ".r", ".jl",
+    }
+    code_files = [
+        p for p in base_path.rglob("*")
+        if p.is_file()
+        and p.suffix.lower() in code_exts
+        and not any(part.startswith(".") for part in p.parts)
+        and "graphify-out" not in p.parts
+        and "__pycache__" not in p.parts
+    ]
+    if not code_files:
+        return False, "No code files found - nothing to rebuild."
+
+    try:
+        extraction = extract(code_files)
+    except Exception as exc:  # pragma: no cover
+        return False, f"Graph extraction failed: {exc}"
+
+    allowed_types = {"code", "document", "paper", "image"}
+    normalized = 0
+    for node in extraction.get("nodes", []):
+        if not isinstance(node, dict):
+            continue
+        file_type = str(node.get("file_type", "code")).lower()
+        if file_type not in allowed_types:
+            node["file_type"] = "document"
+            normalized += 1
+
+    try:
+        graph = build_from_json(extraction)
+        communities = cluster(graph)
+        cohesion = score_all(graph, communities)
+        gods = god_nodes(graph)
+        surprises = surprising_connections(graph, communities)
+        labels = {cid: f"Community {cid}" for cid in communities}
+        detection = {
+            "files": {"code": [str(f) for f in code_files], "document": [], "paper": [], "image": []},
+            "total_files": len(code_files),
+            "total_words": 0,
+        }
+        out = base_path / "graphify-out"
+        out.mkdir(exist_ok=True)
+
+        # Skip suggest_questions (betweenness centrality) to reduce large-repo latency.
+        report = generate(
+            graph,
+            communities,
+            cohesion,
+            labels,
+            gods,
+            surprises,
+            detection,
+            {"input": 0, "output": 0},
+            str(base_path),
+            suggested_questions=[],
+        )
+        (out / "GRAPH_REPORT.md").write_text(report, encoding="utf-8")
+        to_json(graph, communities, str(out / "graph.json"))
+    except Exception as exc:  # pragma: no cover
+        return False, f"Graph rebuild failed: {exc}"
+
+    summary = (
+        f"Graph rebuilt: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges, "
+        f"{len(communities)} communities"
+    )
+    if normalized:
+        summary += f" (normalized {normalized} unsupported file_type values)"
+    return True, summary
+
+
+def _windows_to_wsl_executable(path: str) -> str:
+    """Convert Windows executable path to a WSL mount path for bash execution."""
+    normalized = path.replace("\\", "/")
+    if len(normalized) >= 2 and normalized[1] == ":":
+        drive = normalized[0].lower()
+        rest = normalized[2:].lstrip("/")
+        return f"/mnt/{drive}/{rest}"
+    return normalized
 
 
 def create_default_command_registry() -> CommandRegistry:
@@ -738,6 +838,7 @@ def create_default_command_registry() -> CommandRegistry:
 
         usage = (
             "Usage: /graphify [PATH] [--update|--cluster-only|--watch|--mcp]\n"
+            "       /graphify [PATH] --update [--sync|--background]\n"
             "       /graphify query \"question\" [--dfs]\n"
             "       /graphify path \"A\" \"B\"\n"
             "       /graphify explain \"node\"\n"
@@ -998,35 +1099,57 @@ def create_default_command_registry() -> CommandRegistry:
                 idx += 1
             try:
                 from graphify.ingest import ingest
-                from graphify.watch import _rebuild_code
             except Exception as exc:  # pragma: no cover - import availability varies by environment
                 return CommandResult(message=f"Graphify import failed: {exc}")
             try:
                 raw_dir = Path(context.cwd) / "raw"
                 saved = ingest(url, raw_dir, author=author, contributor=contributor)
-                _rebuild_code(Path(context.cwd))
+                _graphify_rebuild_code_fast(Path(context.cwd))
             except Exception as exc:  # pragma: no cover - runtime errors are environment-dependent
                 return CommandResult(message=f"Failed to add URL: {exc}")
             return CommandResult(message=f"Added {url} to {saved} and updated graph.")
 
         if "--update" in tokens:
-            try:
-                from graphify.watch import _rebuild_code
-            except Exception as exc:  # pragma: no cover - import availability varies by environment
+            run_sync = "--sync" in tokens
+            run_background = ("--background" in tokens) or ("--bg" in tokens) or (not run_sync)
+            if run_background:
+                python_executable = str(Path(sys.executable).resolve())
+                runner_script = str((Path(context.cwd) / "src" / "openharness" / "commands" / "graphify_runner.py").resolve())
+                target_path = str(base_path)
+                if get_platform() == "windows":
+                    # Task manager prefers bash on Windows when available.
+                    # Use /mnt path for python.exe, but C:/ paths for python arguments.
+                    if shutil.which("bash"):
+                        python_executable = _windows_to_wsl_executable(python_executable)
+                        runner_script = runner_script.replace("\\", "/")
+                        target_path = target_path.replace("\\", "/")
+                        command = f"{shlex.quote(python_executable)} {shlex.quote(runner_script)} {shlex.quote(target_path)}"
+                    else:
+                        payload = f'"{python_executable}" "{runner_script}" "{target_path}"'
+                        command = f'cmd.exe /d /s /c "{payload}"'
+                else:
+                    command = f"{shlex.quote(python_executable)} {shlex.quote(runner_script)} {shlex.quote(target_path)}"
+                task = await get_task_manager().create_shell_task(
+                    command=command,
+                    description=f"graphify update {base_path}",
+                    cwd=base_path,
+                )
                 return CommandResult(
                     message=(
-                        "Graphify is not available in this Python environment. "
-                        "Install it first (e.g. uv pip install graphifyy).\n"
-                        f"Import error: {exc}"
+                        f"Started graphify update in background task {task.id}.\n"
+                        "Use /tasks output "
+                        f"{task.id} "
+                        "to follow progress."
                     )
                 )
             try:
-                success = _rebuild_code(base_path)
+                # Rebuild can be CPU-bound on large repos; run in a worker thread so the TUI stays responsive.
+                success, msg = await asyncio.to_thread(_graphify_rebuild_code_fast, base_path)
             except Exception as exc:  # pragma: no cover - runtime errors are environment-dependent
                 return CommandResult(message=f"Graphify update failed: {exc}")
             if success:
-                return CommandResult(message=f"Graph updated successfully for: {base_path}")
-            return CommandResult(message=f"No graph updates were produced for: {base_path}")
+                return CommandResult(message=msg)
+            return CommandResult(message=f"Graph update failed for {base_path}: {msg}")
 
         if "--cluster-only" in tokens:
             try:
