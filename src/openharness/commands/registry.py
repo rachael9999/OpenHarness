@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import re
+import shlex
 import shutil
 import subprocess
+from collections import Counter, deque
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -196,6 +199,65 @@ def _coerce_setting_value(settings: Settings, key: str, raw: str):
             raise ValueError(f"Invalid value for {key}: {raw}")
         return raw
     return raw
+
+
+def _graphify_graph_path(base_path: Path) -> Path:
+    if base_path.is_file() and base_path.suffix.lower() == ".json":
+        return base_path
+    return base_path / "graphify-out" / "graph.json"
+
+
+def _graphify_load_payload(base_path: Path) -> tuple[dict[str, object] | None, str | None]:
+    graph_path = _graphify_graph_path(base_path)
+    if not graph_path.exists():
+        return None, f"Graph not found: {graph_path}. Run /graphify --update first."
+    try:
+        payload = json.loads(graph_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, f"Failed to parse graph file: {exc}"
+    if not isinstance(payload, dict):
+        return None, "Invalid graph format: expected a JSON object."
+    return payload, None
+
+
+def _graphify_build_adjacency(payload: dict[str, object]) -> tuple[dict[str, set[str]], dict[tuple[str, str], dict[str, object]]]:
+    adjacency: dict[str, set[str]] = {}
+    edge_meta: dict[tuple[str, str], dict[str, object]] = {}
+    links = payload.get("links", [])
+    if not isinstance(links, list):
+        return adjacency, edge_meta
+    for edge in links:
+        if not isinstance(edge, dict):
+            continue
+        src = str(edge.get("source", "")).strip()
+        tgt = str(edge.get("target", "")).strip()
+        if not src or not tgt:
+            continue
+        adjacency.setdefault(src, set()).add(tgt)
+        adjacency.setdefault(tgt, set()).add(src)
+        edge_meta[(src, tgt)] = edge
+        edge_meta[(tgt, src)] = edge
+    return adjacency, edge_meta
+
+
+def _graphify_find_best_node(nodes: list[dict[str, object]], text: str) -> str | None:
+    terms = [t for t in re.findall(r"[A-Za-z0-9_]+", text.lower()) if len(t) > 1]
+    if not terms:
+        return None
+    best_id: str | None = None
+    best_score = -1
+    for node in nodes:
+        node_id = str(node.get("id", "")).strip()
+        label = str(node.get("label", "")).lower()
+        if not node_id:
+            continue
+        score = sum(1 for term in terms if term in label)
+        if score > best_score:
+            best_score = score
+            best_id = node_id
+    if best_score <= 0:
+        return None
+    return best_id
 
 
 def create_default_command_registry() -> CommandRegistry:
@@ -667,6 +729,350 @@ def create_default_command_registry() -> CommandRegistry:
             source = f" [{skill.source}]"
             lines.append(f"- {skill.name}{source}: {skill.description}")
         return CommandResult(message="\n".join(lines))
+
+    async def _graphify_handler(args: str, context: CommandContext) -> CommandResult:
+        try:
+            tokens = shlex.split(args)
+        except ValueError as exc:
+            return CommandResult(message=f"Invalid graphify arguments: {exc}")
+
+        usage = (
+            "Usage: /graphify [PATH] [--update|--cluster-only|--watch|--mcp]\n"
+            "       /graphify query \"question\" [--dfs]\n"
+            "       /graphify path \"A\" \"B\"\n"
+            "       /graphify explain \"node\"\n"
+            "       /graphify stats\n"
+            "       /graphify god\n"
+            "       /graphify add \"url\" [--author NAME] [--contributor NAME]"
+        )
+
+        if not tokens:
+            tokens = ["--update"]
+
+        subcommand = tokens[0]
+        base_path = Path(context.cwd)
+
+        if subcommand in {"query", "path", "explain", "stats", "god", "add"}:
+            pass
+        else:
+            remainder = tokens[:]
+            path_token = None
+            for token in remainder:
+                if not token.startswith("--"):
+                    path_token = token
+                    break
+            if path_token is not None:
+                base_path = (Path(context.cwd) / path_token).resolve()
+                tokens.remove(path_token)
+            if not base_path.exists():
+                return CommandResult(message=f"Path not found: {base_path}")
+
+        if subcommand == "query":
+            payload, error = _graphify_load_payload(base_path)
+            if error:
+                return CommandResult(message=error)
+            assert payload is not None
+            nodes = payload.get("nodes", [])
+            if not isinstance(nodes, list) or not nodes:
+                return CommandResult(message="Graph is empty. Run /graphify --update first.")
+            question = " ".join(t for t in tokens[1:] if t != "--dfs").strip()
+            if not question:
+                return CommandResult(message="Usage: /graphify query \"question\" [--dfs]")
+            dfs_mode = "--dfs" in tokens
+            terms = [t for t in re.findall(r"[A-Za-z0-9_]+", question.lower()) if len(t) > 3]
+            if not terms:
+                return CommandResult(message="Please provide a more specific query.")
+            scored: list[tuple[int, str]] = []
+            node_map: dict[str, dict[str, object]] = {}
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                node_id = str(node.get("id", "")).strip()
+                label = str(node.get("label", "")).lower()
+                if not node_id:
+                    continue
+                node_map[node_id] = node
+                score = sum(1 for term in terms if term in label)
+                if score > 0:
+                    scored.append((score, node_id))
+            if not scored:
+                return CommandResult(message=f"No matching nodes found for: {', '.join(terms)}")
+            scored.sort(reverse=True)
+            starts = [node_id for _, node_id in scored[:3]]
+            adjacency, _ = _graphify_build_adjacency(payload)
+            visited: set[str] = set()
+            if dfs_mode:
+                stack: list[tuple[str, int]] = [(n, 0) for n in reversed(starts)]
+                while stack:
+                    node_id, depth = stack.pop()
+                    if node_id in visited or depth > 6:
+                        continue
+                    visited.add(node_id)
+                    for neighbor in sorted(adjacency.get(node_id, set())):
+                        if neighbor not in visited:
+                            stack.append((neighbor, depth + 1))
+            else:
+                queue: deque[tuple[str, int]] = deque((n, 0) for n in starts)
+                while queue:
+                    node_id, depth = queue.popleft()
+                    if node_id in visited or depth > 3:
+                        continue
+                    visited.add(node_id)
+                    for neighbor in sorted(adjacency.get(node_id, set())):
+                        if neighbor not in visited:
+                            queue.append((neighbor, depth + 1))
+            ranked = sorted(visited, key=lambda nid: len(adjacency.get(nid, set())), reverse=True)[:40]
+            lines = [f"Graph query ({'DFS' if dfs_mode else 'BFS'}) matched {len(ranked)} nodes:"]
+            for node_id in ranked:
+                node = node_map.get(node_id, {})
+                label = str(node.get("label", node_id))
+                comm = str(node.get("community", "?"))
+                src = str(node.get("source_location", "")).strip()
+                suffix = f" -> {src}" if src else ""
+                lines.append(f"[{comm}] {label}{suffix}")
+            return CommandResult(message="\n".join(lines))
+
+        if subcommand == "path":
+            payload, error = _graphify_load_payload(base_path)
+            if error:
+                return CommandResult(message=error)
+            assert payload is not None
+            nodes = payload.get("nodes", [])
+            if not isinstance(nodes, list):
+                return CommandResult(message="Invalid graph nodes format.")
+            if len(tokens) < 3:
+                return CommandResult(message="Usage: /graphify path \"A\" \"B\"")
+            src_name = tokens[1]
+            dst_name = tokens[2]
+            src_id = _graphify_find_best_node([n for n in nodes if isinstance(n, dict)], src_name)
+            dst_id = _graphify_find_best_node([n for n in nodes if isinstance(n, dict)], dst_name)
+            if not src_id:
+                return CommandResult(message=f"Source not found: {src_name}")
+            if not dst_id:
+                return CommandResult(message=f"Target not found: {dst_name}")
+            adjacency, _ = _graphify_build_adjacency(payload)
+            parent: dict[str, str | None] = {src_id: None}
+            queue: deque[str] = deque([src_id])
+            found = False
+            while queue and not found:
+                current = queue.popleft()
+                for neighbor in sorted(adjacency.get(current, set())):
+                    if neighbor in parent:
+                        continue
+                    parent[neighbor] = current
+                    if neighbor == dst_id:
+                        found = True
+                        break
+                    queue.append(neighbor)
+            if not found:
+                return CommandResult(message=f"No path found between {src_name} and {dst_name}")
+            route: list[str] = []
+            cur: str | None = dst_id
+            while cur is not None:
+                route.append(cur)
+                cur = parent.get(cur)
+            route.reverse()
+            node_map = {
+                str(n.get("id", "")): n
+                for n in nodes
+                if isinstance(n, dict) and str(n.get("id", "")).strip()
+            }
+            lines = [f"Shortest path ({len(route) - 1} hops):"]
+            for i, node_id in enumerate(route):
+                label = str(node_map.get(node_id, {}).get("label", node_id))
+                lines.append(f"{'  -> ' * i}{label}")
+            return CommandResult(message="\n".join(lines))
+
+        if subcommand == "explain":
+            payload, error = _graphify_load_payload(base_path)
+            if error:
+                return CommandResult(message=error)
+            assert payload is not None
+            nodes = payload.get("nodes", [])
+            if not isinstance(nodes, list) or len(tokens) < 2:
+                return CommandResult(message="Usage: /graphify explain \"node\"")
+            needle = tokens[1].lower()
+            node_match = None
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                label = str(node.get("label", "")).lower()
+                if needle in label:
+                    node_match = node
+                    break
+            if node_match is None:
+                return CommandResult(message=f"Node not found: {tokens[1]}")
+            node_id = str(node_match.get("id", ""))
+            adjacency, edge_meta = _graphify_build_adjacency(payload)
+            neighbors = sorted(adjacency.get(node_id, set()), key=lambda n: len(adjacency.get(n, set())), reverse=True)[:20]
+            node_map = {
+                str(n.get("id", "")): n
+                for n in nodes
+                if isinstance(n, dict) and str(n.get("id", "")).strip()
+            }
+            lines = [
+                f"{node_match.get('label', node_id)}",
+                f"source: {node_match.get('source_file', '?')} {node_match.get('source_location', '')}".rstrip(),
+                f"type: {node_match.get('file_type', '?')}",
+                f"community: {node_match.get('community', '?')}",
+                f"connections: {len(adjacency.get(node_id, set()))}",
+                "",
+                "neighbors:",
+            ]
+            for neighbor in neighbors:
+                edge = edge_meta.get((node_id, neighbor), {})
+                label = str(node_map.get(neighbor, {}).get("label", neighbor))
+                relation = str(edge.get("relation", "?"))
+                confidence = str(edge.get("confidence", "?"))
+                lines.append(f"- {label} [{relation}] [{confidence}]")
+            return CommandResult(message="\n".join(lines))
+
+        if subcommand == "stats":
+            payload, error = _graphify_load_payload(base_path)
+            if error:
+                return CommandResult(message=error)
+            assert payload is not None
+            nodes = payload.get("nodes", [])
+            links = payload.get("links", [])
+            if not isinstance(nodes, list) or not isinstance(links, list):
+                return CommandResult(message="Invalid graph format.")
+            communities = {
+                str(node.get("community", "?"))
+                for node in nodes
+                if isinstance(node, dict)
+            }
+            confidence = Counter(
+                str(edge.get("confidence", "EXTRACTED"))
+                for edge in links
+                if isinstance(edge, dict)
+            )
+            total_edges = max(1, len(links))
+            lines = [
+                f"Nodes: {len(nodes)}",
+                f"Edges: {len(links)}",
+                f"Communities: {len(communities)}",
+                f"EXTRACTED: {confidence.get('EXTRACTED', 0) / total_edges * 100:.0f}%",
+                f"INFERRED: {confidence.get('INFERRED', 0) / total_edges * 100:.0f}%",
+                f"AMBIGUOUS: {confidence.get('AMBIGUOUS', 0) / total_edges * 100:.0f}%",
+            ]
+            return CommandResult(message="\n".join(lines))
+
+        if subcommand == "god":
+            payload, error = _graphify_load_payload(base_path)
+            if error:
+                return CommandResult(message=error)
+            assert payload is not None
+            nodes = payload.get("nodes", [])
+            if not isinstance(nodes, list):
+                return CommandResult(message="Invalid graph nodes format.")
+            adjacency, _ = _graphify_build_adjacency(payload)
+            node_map = {
+                str(n.get("id", "")): n
+                for n in nodes
+                if isinstance(n, dict) and str(n.get("id", "")).strip()
+            }
+            ranked = sorted(adjacency.keys(), key=lambda nid: len(adjacency.get(nid, set())), reverse=True)[:15]
+            lines = ["God nodes (most connected):"]
+            for i, node_id in enumerate(ranked, 1):
+                label = str(node_map.get(node_id, {}).get("label", node_id))
+                lines.append(f"{i}. {label} - {len(adjacency.get(node_id, set()))} edges")
+            return CommandResult(message="\n".join(lines))
+
+        if subcommand == "add":
+            if len(tokens) < 2:
+                return CommandResult(message="Usage: /graphify add \"url\" [--author NAME] [--contributor NAME]")
+            url = tokens[1]
+            author = None
+            contributor = None
+            idx = 2
+            while idx < len(tokens):
+                token = tokens[idx]
+                if token == "--author" and idx + 1 < len(tokens):
+                    author = tokens[idx + 1]
+                    idx += 2
+                    continue
+                if token == "--contributor" and idx + 1 < len(tokens):
+                    contributor = tokens[idx + 1]
+                    idx += 2
+                    continue
+                idx += 1
+            try:
+                from graphify.ingest import ingest
+                from graphify.watch import _rebuild_code
+            except Exception as exc:  # pragma: no cover - import availability varies by environment
+                return CommandResult(message=f"Graphify import failed: {exc}")
+            try:
+                raw_dir = Path(context.cwd) / "raw"
+                saved = ingest(url, raw_dir, author=author, contributor=contributor)
+                _rebuild_code(Path(context.cwd))
+            except Exception as exc:  # pragma: no cover - runtime errors are environment-dependent
+                return CommandResult(message=f"Failed to add URL: {exc}")
+            return CommandResult(message=f"Added {url} to {saved} and updated graph.")
+
+        if "--update" in tokens:
+            try:
+                from graphify.watch import _rebuild_code
+            except Exception as exc:  # pragma: no cover - import availability varies by environment
+                return CommandResult(
+                    message=(
+                        "Graphify is not available in this Python environment. "
+                        "Install it first (e.g. uv pip install graphifyy).\n"
+                        f"Import error: {exc}"
+                    )
+                )
+            try:
+                success = _rebuild_code(base_path)
+            except Exception as exc:  # pragma: no cover - runtime errors are environment-dependent
+                return CommandResult(message=f"Graphify update failed: {exc}")
+            if success:
+                return CommandResult(message=f"Graph updated successfully for: {base_path}")
+            return CommandResult(message=f"No graph updates were produced for: {base_path}")
+
+        if "--cluster-only" in tokens:
+            try:
+                from graphify.build import build_from_json
+                from graphify.cluster import cluster, score_all
+                from graphify.export import to_json
+            except Exception as exc:  # pragma: no cover
+                return CommandResult(message=f"Graphify import failed: {exc}")
+            graph_path = _graphify_graph_path(base_path)
+            if not graph_path.exists():
+                return CommandResult(message=f"Graph not found: {graph_path}. Run /graphify --update first.")
+            try:
+                extraction = json.loads(graph_path.read_text(encoding="utf-8"))
+                graph = build_from_json(extraction)
+                communities = cluster(graph)
+                cohesion = score_all(graph, communities)
+                to_json(graph, communities, str(graph_path))
+            except Exception as exc:  # pragma: no cover
+                return CommandResult(message=f"Cluster-only run failed: {exc}")
+            avg = (sum(cohesion.values()) / len(cohesion)) if cohesion else 0.0
+            return CommandResult(
+                message=(
+                    f"Reclustered graph: {len(communities)} communities\n"
+                    f"Average cohesion: {avg:.3f}\n"
+                    f"Updated: {graph_path}"
+                )
+            )
+
+        if "--watch" in tokens:
+            return CommandResult(
+                message=(
+                    "/graphify --watch is long-running and should be started in a shell.\n"
+                    f"Run: uv run python -m graphify.watch {base_path}"
+                )
+            )
+
+        if "--mcp" in tokens:
+            graph_path = _graphify_graph_path(base_path)
+            return CommandResult(
+                message=(
+                    "/graphify --mcp is long-running and should be started in a shell.\n"
+                    f"Run: uv run python -c \"from graphify.serve import serve; serve('{graph_path.as_posix()}')\""
+                )
+            )
+
+        return CommandResult(message=usage)
 
     async def _config_handler(args: str, context: CommandContext) -> CommandResult:
         del context
@@ -1499,6 +1905,7 @@ def create_default_command_registry() -> CommandRegistry:
     registry.register(SlashCommand("feedback", "Save CLI feedback to the local feedback log", _feedback_handler))
     registry.register(SlashCommand("onboarding", "Show the quickstart guide", _onboarding_handler))
     registry.register(SlashCommand("skills", "List or show available skills", _skills_handler))
+    registry.register(SlashCommand("graphify", "Update or inspect graphify graph outputs", _graphify_handler))
     registry.register(SlashCommand("config", "Show or update configuration", _config_handler))
     registry.register(SlashCommand("mcp", "Show MCP status", _mcp_handler))
     registry.register(SlashCommand("plugin", "Manage plugins", _plugin_handler))
